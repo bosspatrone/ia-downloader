@@ -867,7 +867,6 @@ async function go() {
           const j = data.jobs[i];
           addCard(j.job_id, {artist:'…', album:j.identifier, fmt:'—', cat:j.category,
                              identifier:j.identifier, duplicate:false, pct:0, status:'pending_meta', count:0, total:0});
-          watch(j.job_id);
         }
         if(i < data.jobs.length) {
           requestAnimationFrame(batch);
@@ -881,7 +880,6 @@ async function go() {
     } else {
       addCard(data.job_id, {artist:data.artist, album:data.album, fmt:data.format, cat:data.category,
                             identifier:data.identifier||'', duplicate:data.duplicate, pct:0, status:'queued', count:0, total:data.total});
-      watch(data.job_id);
       urlEl.value='';
       btn.disabled=false;
       closeDrawer();
@@ -892,62 +890,41 @@ async function go() {
   }
 }
 
-const _watching = new Set();
+// One shared progress stream for every job (one EventSource per job ran out of
+// connections over HTTP/1.1). Messages carry changed jobs and/or the queue order.
+let _progressES = null;
+let _queuePos = new Map();
 
-function watch(id) {
-  if(_watching.has(id)) return;
-  _watching.add(id);
-  let es, done = false;
-  function connect() {
-    if(done) return;
-    es = new EventSource('/api/progress/'+id);
-    es.onmessage = e => {
-      if(e.data.startsWith(':')) return;
-      const d = JSON.parse(e.data);
-      patchCard(id, {pct:d.pct, count:d.count, total:d.total, status:d.status, msg:d.error||'',
-                     queue_pos:d.queue_pos, artist:d.artist, album:d.album, category:d.category, fmt:d.fmt});
-      if(d.status==='done'||d.status==='error'){
-        done=true; _watching.delete(id); es.close();
-        setTimeout(_syncJobStatuses, 2000);
-      }
-    };
-    es.onerror = () => { es.close(); if(!done) setTimeout(connect, 2000); };
-  }
-  connect();
-}
-
-// After a download completes, sync all changed statuses from server
-// so pending_meta tiles update to done in the grid.
-async function _syncJobStatuses() {
-  try {
-    const res = await fetch('/api/jobs');
-    const list = await res.json();
-    list.forEach(j => {
-      const old = jobData.get(j.job_id);
-      if(!old) return;
-      if(old.status !== j.status) {
-        patchCard(j.job_id, {status:j.status, artist:j.artist, album:j.album,
-          identifier:j.identifier, category:j.category, pct:j.pct||0,
-          queue_pos:j.queue_pos||0, error:j.error||null, total:j.total||0, count:j.count||0});
-      }
-      if(WATCH_STATUSES.has(j.status) && !_watching.has(j.job_id)) watch(j.job_id);
+function startProgressStream() {
+  if(_progressES) return;
+  const es = new EventSource('/api/progress');
+  _progressES = es;
+  es.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if(m.queue) _applyQueueOrder(m.queue);
+    if(m.jobs) m.jobs.forEach(d => {
+      patchCard(d.job_id, {pct:d.pct, count:d.count, total:d.total, status:d.status, msg:d.error||'',
+                           queue_pos:_queuePos.get(d.job_id)||0, artist:d.artist, album:d.album,
+                           category:d.category, fmt:d.fmt});
     });
-  } catch(e) {}
+  };
+  es.onerror = () => { es.close(); _progressES = null; setTimeout(startProgressStream, 2000); };
 }
 
-// Poll every 4 s to pick up any running job the frontend isn't watching
-// (happens when pending_meta jobs transition to running between SSE connections)
+function _applyQueueOrder(order) {
+  const next = new Map(order.map((id, i) => [id, i+1]));
+  _queuePos.forEach((_, id) => { if(!next.has(id)) _setQueuePos(id, 0); });
+  next.forEach((pos, id) => _setQueuePos(id, pos));
+  _queuePos = next;
+  _refreshDrawerActive();
+}
+
+// Poll every 4 s for the pause state (progress itself arrives over the stream)
 setInterval(async () => {
   try {
     const res = await fetch('/api/status');
     const data = await res.json();
     applyPauseState(data.paused);
-    if(data.running && !_watching.has(data.running.job_id)) {
-      const r = data.running;
-      patchCard(r.job_id, {status:r.status, artist:r.artist, album:r.album,
-        identifier:r.identifier, category:r.category, fmt:r.fmt, pct:0});
-      watch(r.job_id);
-    }
   } catch(e) {}
 }, 4000);
 
@@ -1191,8 +1168,6 @@ async function removeJob(id) {
 
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-const WATCH_STATUSES = new Set(['running','fetching','queued','verifying']);
-
 async function loadExisting() {
   const res = await fetch('/api/jobs');
   const list = await res.json();
@@ -1204,9 +1179,9 @@ async function loadExisting() {
       pct:j.pct||0, count:j.count||0, total:j.total||0,
       status:j.status, error:j.error||null, queue_pos:j.queue_pos||0
     });
-    if(WATCH_STATUSES.has(j.status)) watch(j.job_id);
   });
   rebuildView();
+  startProgressStream();
 }
 
 async function clearAll() {
@@ -1229,7 +1204,6 @@ async function retryJob(id) {
   const data = await res.json();
   const old = jobData.get(id)||{};
   patchCard(id, {...old, status:data.status, error:null});
-  watch(id);
 }
 
 async function moveToFront(id) {
@@ -1245,24 +1219,28 @@ async function _refreshQueuePositions() {
     const res = await fetch('/api/jobs');
     const list = await res.json();
     list.forEach(j => {
-      if(j.status!=='queued' && j.status!=='pending_meta') return;
-      const old = jobData.get(j.job_id);
-      const pos = j.queue_pos||0;
-      if(!old || (old.queue_pos||0)===pos) return;
-      _storeSet(j.job_id, {...old, queue_pos:pos});
-      const el = document.getElementById(cardId(j.job_id));
-      if(!el) return;
-      el.dataset.queuePos = String(pos);
-      const qb = document.getElementById(cardId(j.job_id)+'-qb');
-      if(qb){ if(pos>0){ qb.textContent='#'+pos; qb.classList.add('visible'); } else qb.classList.remove('visible'); }
-      if(currentFilter!=='all') el.style.order = calcOrder(j.status, pos);
-      if(j.status==='queued'){
-        const msg = el.querySelector('.card-foot span:first-child');
-        if(msg) msg.textContent = pos>0?`Queued · #${pos}`:'Queued…';
-      }
+      if(j.status==='queued' || j.status==='pending_meta') _setQueuePos(j.job_id, j.queue_pos||0);
     });
     _refreshDrawerActive();
   } catch(e) {}
+}
+
+// Update one job's queue number in the store and on its card, without the full
+// patchCard path (a reorder can shift ~2k jobs at once)
+function _setQueuePos(id, pos) {
+  const old = jobData.get(id);
+  if(!old || (old.queue_pos||0)===pos) return;
+  _storeSet(id, {...old, queue_pos:pos});
+  const el = document.getElementById(cardId(id));
+  if(!el) return;
+  el.dataset.queuePos = String(pos);
+  const qb = document.getElementById(cardId(id)+'-qb');
+  if(qb){ if(pos>0){ qb.textContent='#'+pos; qb.classList.add('visible'); } else qb.classList.remove('visible'); }
+  if(currentFilter!=='all') el.style.order = calcOrder(old.status, pos);
+  if(old.status==='queued'){
+    const msg = el.querySelector('.card-foot span:first-child');
+    if(msg) msg.textContent = pos>0?`Queued · #${pos}`:'Queued…';
+  }
 }
 
 async function retryFailed() {
@@ -1281,7 +1259,6 @@ async function retryFailed() {
       const msg = el.querySelector('.card-foot span:first-child');
       if(msg){ msg.className='s-queue'; msg.textContent='Queued…'; }
     }
-    watch(id);
   });
   rebuildView();
 }
@@ -2049,58 +2026,60 @@ async def serve_media(job_id: str, path: str):
     return FileResponse(file_path)
 
 
-@app.get("/api/progress/{job_id}")
-async def progress_stream(job_id: str):
+def _progress_sig(job: dict) -> tuple:
+    return (len(job.get("downloaded", ())), len(job.get("expected", [])), job["status"],
+            job.get("error"), job.get("category", ""), job.get("fmt", "—"),
+            job.get("artist", ""), job.get("album", ""))
+
+
+def _progress_entry(job_id: str, job: dict) -> dict:
+    count = len(job.get("downloaded", ()))
+    total = len(job.get("expected", []))
+    return {
+        "job_id": job_id, "count": count, "total": total,
+        "pct": int(100 * count / total) if total else 0,
+        "status": job["status"], "error": job.get("error"),
+        "artist": job.get("artist", ""), "album": job.get("album", ""),
+        "category": job.get("category", ""), "fmt": job.get("fmt", "—"),
+    }
+
+
+@app.get("/api/progress")
+async def progress_stream():
+    """One stream for the whole page: changed jobs, plus the queue order whenever
+    it changes (sent as one id list rather than a position update per job)."""
     async def generate():
-        last_count = -1
-        last_pos   = -1
-        last_status   = None
-        last_category = None
-        last_dl_set: frozenset = frozenset()
+        last: Dict[str, tuple] = {}
+        last_queue: List[str] | None = None
+        first = True
         idle_ticks = 0
         while True:
-            if job_id not in jobs:
-                yield f"data: {json.dumps({'error': 'not found'})}\n\n"
-                return
-            job      = jobs[job_id]
-            count    = len(job["downloaded"])
-            total    = len(job.get("expected", []))
-            status   = job["status"]
-            pct      = int(100 * count / total) if total else 0
-            pos      = queue_list.index(job_id) + 1 if job_id in queue_list else 0
-            fs       = job.get("file_states", {})
-            dl_set   = frozenset(f for f, p in fs.items() if 0 < p < 100)
-            category = job.get("category", "")
-
-            changed = (count != last_count or pos != last_pos or
-                       status in ("done", "error") or
-                       dl_set != last_dl_set or
-                       status != last_status or
-                       category != last_category)
-
+            changed = []
+            for jid, job in list(jobs.items()):
+                sig = _progress_sig(job)
+                if last.get(jid) != sig:
+                    # On connect the page has just loaded /api/jobs, so only resend
+                    # jobs that may have moved on since then
+                    if not first or job["status"] in ("running", "verifying", "queued"):
+                        changed.append(_progress_entry(jid, job))
+                    last[jid] = sig
+            for jid in [k for k in last if k not in jobs]:
+                del last[jid]
+            msg = {}
             if changed:
-                last_count    = count
-                last_pos      = pos
-                last_status   = status
-                last_category = category
-                last_dl_set   = dl_set
-                idle_ticks    = 0
-                payload = {
-                    'count': count, 'total': total, 'pct': pct,
-                    'status': status, 'error': job['error'],
-                    'queue_pos': pos, 'file_states': fs,
-                    'artist': job.get('artist', ''), 'album': job.get('album', ''),
-                    'category': category, 'fmt': job.get('fmt', '—'),
-                }
-                yield f"data: {json.dumps(payload)}\n\n"
+                msg["jobs"] = changed
+            if queue_list != last_queue:
+                last_queue = list(queue_list)
+                msg["queue"] = last_queue
+            first = False
+            if msg:
+                idle_ticks = 0
+                yield f"data: {json.dumps(msg)}\n\n"
             else:
                 idle_ticks += 1
                 if idle_ticks >= 16:
                     idle_ticks = 0
                     yield ": keep-alive\n\n"
-
-            if status in ("done", "error"):
-                return
             await asyncio.sleep(1.5)
 
     return StreamingResponse(
