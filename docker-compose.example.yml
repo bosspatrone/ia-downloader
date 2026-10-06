@@ -1,0 +1,14 @@
+services:
+  ia-downloader:
+    build: .
+    image: ia-downloader:latest
+    container_name: ia-downloader
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Library root: downloads land in <category>/<identifier>/, and the job
+      # list, queue order, and download history are kept here as dotfiles
+      - /path/to/your/Audio:/music
+      # Optional: credentials from `ia configure`, for items that need a login
+      - ~/.config/internetarchive:/root/.config/internetarchive:ro
