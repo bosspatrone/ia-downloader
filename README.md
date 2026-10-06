@@ -46,3 +46,7 @@ Inside the mounted library folder (`/music` in the container):
 ## Stack
 
 FastAPI and uvicorn, serving a single-page frontend from `main.py`. No database.
+
+## License
+
+[MIT](LICENSE)
