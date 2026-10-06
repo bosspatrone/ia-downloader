@@ -1820,7 +1820,12 @@ async def run_download(job_id: str, glob: str, verify: bool = False):
             "--no-directories", "--no-change-timestamp",
             "--glob", glob,
         ]
-        if verify:
+        # ia skips a finished file only when its mtime matches archive.org's, which
+        # --no-change-timestamp prevents, so a resumed job would re-download every
+        # file. With files already on disk, compare MD5s instead: matches are skipped.
+        resuming = any(os.path.exists(os.path.join(job["dest"], name))
+                       for name in job.get("expected", []))
+        if verify or resuming:
             cmd.append("--checksum")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
