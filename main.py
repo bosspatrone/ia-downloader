@@ -8,6 +8,7 @@ from typing import Dict, List, Set
 
 AUDIO_ROOT = "/music"
 HISTORY_FILE = "/music/.ia-history"
+BLOCK_FILE   = "/music/.ia-blocklist"   # permanently deleted identifiers: never download again
 CATEGORIES = ["Video Game", "Music", "Classical", "Jazz", "Anime", "Sound Effects"]
 JOBS_FILE  = "/music/.ia-jobs.json"
 QUEUE_FILE = "/music/.ia-queue.json"
@@ -88,6 +89,30 @@ def history_contains(identifier: str) -> bool:
 def history_add(identifier: str):
     with open(HISTORY_FILE, "a") as f:
         f.write(identifier + "\n")
+
+
+def history_remove(identifier: str):
+    try:
+        with open(HISTORY_FILE) as f:
+            lines = [line for line in f if line.strip() != identifier]
+        with open(HISTORY_FILE, "w") as f:
+            f.writelines(lines)
+    except FileNotFoundError:
+        pass
+
+
+def blocklist() -> Set[str]:
+    try:
+        with open(BLOCK_FILE) as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def blocklist_add(identifier: str):
+    if identifier not in blocklist():
+        with open(BLOCK_FILE, "a") as f:
+            f.write(identifier + "\n")
 
 
 def _auto_categorize(md: dict) -> str:
@@ -239,6 +264,8 @@ async def _resolve_and_download(job_id: str):
     if job.get("status") == "pending_meta":
         identifier = job["identifier"]
         meta = await _fetch_meta(identifier)
+        if jobs.get(job_id) is not job or job.get("status") != "pending_meta":
+            return  # removed or deleted while metadata was being fetched
         if not meta:
             job["status"] = "error"
             job["error"]  = f"No metadata for '{identifier}'"
@@ -385,6 +412,14 @@ select option{background:#01030a;}
 .job.error .card-prog .bar-fill{background:var(--red);}
 .card-x{position:absolute;top:.35rem;right:.35rem;background:rgba(0,0,0,.6);border:none;color:rgba(255,255,255,.75);width:1.5rem;height:1.5rem;border-radius:50%;font-size:.7rem;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;transition:background .15s,color .15s;font-family:inherit;font-weight:400;letter-spacing:0;text-transform:none;min-width:unset;line-height:1;}
 .card-x:hover{background:var(--red);color:#fff;}
+.job.removed{border-color:rgba(200,200,210,.25);}
+.job.removed .overlay-icon{opacity:1;}
+.card-menu{position:fixed;z-index:300;min-width:200px;background:rgba(1,5,18,.98);border:1px solid var(--border);border-radius:8px;padding:.3rem 0;box-shadow:0 8px 24px rgba(0,0,0,.5);display:none;}
+.card-menu.open{display:block;}
+.card-menu button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--text);padding:.6rem 1rem;font-family:'Inter',sans-serif;font-size:.8rem;font-weight:400;letter-spacing:0;text-transform:none;cursor:pointer;min-width:unset;line-height:1.3;}
+.card-menu button:hover{background:rgba(0,210,195,.08);color:var(--teal);}
+.card-menu button.danger{color:var(--red);}
+.card-menu button.danger:hover{background:rgba(239,68,68,.1);color:var(--red);}
 .q-badge{position:absolute;top:.35rem;left:.35rem;background:rgba(0,0,0,.65);color:var(--dim);font-family:'Orbitron',sans-serif;font-size:.48rem;letter-spacing:.06em;padding:.2rem .4rem;border-radius:3px;display:none;}
 .q-badge.visible{display:block;}
 
@@ -486,6 +521,7 @@ input[type=range].pl-seek::-moz-range-thumb,input[type=range].pl-vol::-moz-range
   .card-foot{font-size:.6rem;}
   .dup-banner{font-size:.56rem;padding:.2rem .4rem;}
   .card-x{width:1.7rem;height:1.7rem;}
+  .card-menu button{padding:.8rem 1rem;font-size:.9rem;}
   /* iOS zooms the page when focusing an input under 16px */
   #search-input-mobile{font-size:16px;}
   /* player: seek bar becomes a strip along the top edge; volume is hidden
@@ -576,6 +612,7 @@ h1{font-family:'Orbitron',sans-serif;font-size:1rem;letter-spacing:.12em;text-tr
   <button class="filter-btn" data-filter="active" onclick="setFilter('active')">Active<span class="filter-count" id="fc-active"></span></button>
   <button class="filter-btn" data-filter="completed" onclick="setFilter('completed')">Completed<span class="filter-count" id="fc-completed"></span></button>
   <button class="filter-btn" data-filter="failed" onclick="setFilter('failed')">Failed<span class="filter-count" id="fc-failed"></span></button>
+  <button class="filter-btn" data-filter="hidden" onclick="setFilter('hidden')">Hidden<span class="filter-count" id="fc-hidden"></span></button>
 </div>
 
 <!-- card grid -->
@@ -637,6 +674,7 @@ h1{font-family:'Orbitron',sans-serif;font-size:1rem;letter-spacing:.12em;text-tr
   </div>
 </div>
 
+<div id="card-menu" class="card-menu"></div>
 <div id="player-bar" class="player-bar hidden">
   <img id="pl-art" class="pl-art" src="" alt="" style="display:none">
   <div id="pl-art-ph" class="pl-art-ph"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
@@ -689,9 +727,11 @@ const imgObserver = new IntersectionObserver(entries => {
 
 /* ── data store ── */
 const jobData = new Map();
-const _fc = {all:0, active:0, completed:0, failed:0};
+const _fc = {all:0, active:0, completed:0, failed:0, hidden:0};
 
-function _fcDelta(s, sign) {
+function _fcDelta(d, sign) {
+  if(d.hidden) { _fc.hidden += sign; return; }
+  const s = d.status;
   _fc.all += sign;
   if(['queued','pending_meta','running','verifying','fetching'].includes(s||'')) _fc.active  += sign;
   if(s==='done')  _fc.completed += sign;
@@ -699,17 +739,17 @@ function _fcDelta(s, sign) {
 }
 function _storeSet(id, data) {
   const old = jobData.get(id);
-  if(old) _fcDelta(old.status, -1);
+  if(old) _fcDelta(old, -1);
   jobData.set(id, data);
-  _fcDelta(data.status, +1);
+  _fcDelta(data, +1);
 }
 function _storeDelete(id) {
   const old = jobData.get(id);
-  if(old) _fcDelta(old.status, -1);
+  if(old) _fcDelta(old, -1);
   jobData.delete(id);
 }
 function _updateCountBadges() {
-  ['all','active','completed','failed'].forEach(f => {
+  ['all','active','completed','failed','hidden'].forEach(f => {
     const el = document.getElementById('fc-'+f);
     if(!el) return;
     const n = _fc[f];
@@ -730,9 +770,11 @@ let currentFilter = 'all';
 let currentSearch = '';
 const VIEW_SIZE   = 200;
 
-function matchesFilter(status, f) {
+function matchesFilter(d, f) {
+  if(f==='hidden') return !!d.hidden;
+  if(d.hidden) return false;
   if(f==='all') return true;
-  const s = status||'';
+  const s = d.status||'';
   if(f==='active')    return ['queued','pending_meta','running','verifying','fetching'].includes(s);
   if(f==='completed') return s==='done';
   if(f==='failed')    return s==='error';
@@ -776,7 +818,7 @@ function _albumKey(d) {
 
 function _sortedMatching() {
   const entries = [...jobData.entries()]
-    .filter(([,d]) => matchesFilter(d.status||'', currentFilter) && matchesSearch(d));
+    .filter(([,d]) => matchesFilter(d, currentFilter) && matchesSearch(d));
   if(currentFilter === 'all') {
     return entries.sort((a,b) => _albumKey(a[1]).localeCompare(_albumKey(b[1])));
   }
@@ -831,6 +873,7 @@ function calcOrder(status, queuePos) {
     return pos > 0 ? 100 + pos : 900;  // assigned positions 101–899; unpositioned stubs 900
   }
   if(status==='done')  return 1000;
+  if(status==='removed') return 1500;
   if(status==='error') return 2000;
   return 500;
 }
@@ -943,6 +986,7 @@ function _cardFootState(d) {
   const s = d.status||'';
   if(s==='done')    return ['s-done',  'Complete'];
   if(s==='error')   return ['s-err',   d.error||d.msg||'Error'];
+  if(s==='removed') return ['s-queue', 'Files removed'];
   if(s==='running'||s==='verifying') return ['s-run', d.pct>0?`${d.pct}%`:(s==='verifying'?'Verifying…':'Starting…')];
   if(s==='queued')  return ['s-queue', (d.queue_pos||0)>0?`Queued · #${d.queue_pos}`:'Queued…'];
   if(s==='fetching'||s==='pending_meta') return ['s-queue','Resolving…'];
@@ -958,12 +1002,13 @@ function _makeCardEl(id, d) {
   el.style.order      = calcOrder(d.status||'', d.queue_pos||0);
   if(d.status==='done')  el.classList.add('done');
   if(d.status==='error') el.classList.add('error');
+  if(d.status==='removed') el.classList.add('removed');
   if(playerJobId===id)   el.classList.add('now-playing');
 
   const imgUrl = d.identifier ? `https://archive.org/services/img/${encodeURIComponent(d.identifier)}` : '';
   const thumb  = imgUrl ? `<img class="cover-img" data-src="${imgUrl}" alt="">` : `<div class="cover-ph">${MUSIC_NOTE_SVG}</div>`;
   const dupHtml  = d.duplicate ? `<div class="dup-banner">${DUP_SVG}Already in library</div>` : '';
-  const oiHtml   = d.status==='error' ? _errOiHtml(id) : '';
+  const oiHtml   = (d.status==='error'||d.status==='removed') ? _errOiHtml(id) : '';
   const qbVis    = (d.queue_pos||0)>0;
   const [footCls, footTxt] = _cardFootState(d);
   const ct       = d.total ? `${d.count||0} / ${d.total}` : '';
@@ -973,7 +1018,7 @@ function _makeCardEl(id, d) {
       ${thumb}
       <div class="card-overlay"><span class="overlay-icon" id="${cardId(id)}-oi">${oiHtml}</span></div>
       <div class="card-prog"><div class="bar-fill" style="width:${d.pct||0}%"></div></div>
-      <button class="card-x" onclick="removeJob('${id}')">✕</button>
+      <button class="card-x" onclick="openCardMenu(event,'${id}')" title="Options">✕</button>
       <button class="card-play" onclick="playAlbum('${id}')" title="Play">▶</button>
       <button class="card-front" onclick="moveToFront('${id}')" title="Move to front of queue">⤒</button>
       <span class="q-badge${qbVis?' visible':''}" id="${cardId(id)}-qb">${qbVis?'#'+(d.queue_pos):''}</span>
@@ -1002,7 +1047,7 @@ function addCard(id, d) {
   const merged = {...(jobData.get(id)||{}), ...d, job_id:id};
   _storeSet(id, merged);
   document.querySelector('.empty')?.remove();
-  if(!document.getElementById(cardId(id)) && matchesFilter(merged.status||'', currentFilter)) {
+  if(!document.getElementById(cardId(id)) && matchesFilter(merged, currentFilter)) {
     const el = _makeCardEl(id, merged);
     const lm = document.getElementById('load-more');
     if(lm) lm.before(el); else jobsEl.prepend(el);
@@ -1021,7 +1066,7 @@ function patchCard(id, d) {
   const el = document.getElementById(cardId(id));
   if(!el) {
     // Not in DOM. If new status now matches the current filter and search, insert it.
-    if(d.status && matchesFilter(d.status, currentFilter) && matchesSearch(merged)) {
+    if(d.status && matchesFilter(merged, currentFilter) && matchesSearch(merged)) {
       const newEl = _makeCardEl(id, merged);
       const lm = document.getElementById('load-more');
       if(lm) lm.before(newEl); else jobsEl.prepend(newEl);
@@ -1056,6 +1101,14 @@ function patchCard(id, d) {
   const oi  = document.getElementById(cardId(id)+'-oi');
   const msg = el.querySelector('.card-foot span:first-child');
 
+  if(d.status) {
+    // Only the current state's class may remain (a retried card used to stay red)
+    el.classList.toggle('done',    d.status==='done');
+    el.classList.toggle('error',   d.status==='error');
+    el.classList.toggle('removed', d.status==='removed');
+    if(oi && d.status!=='error' && d.status!=='removed') oi.innerHTML='';
+  }
+
   if(d.status==='done') {
     el.classList.add('done');
     if(oi) oi.innerHTML='';
@@ -1065,6 +1118,12 @@ function patchCard(id, d) {
     el.classList.add('error');
     if(oi) oi.innerHTML=_errOiHtml(id);
     if(msg){ msg.className='s-err'; msg.textContent=d.msg||'Error'; }
+    _removeRing(id);
+  } else if(d.status==='removed') {
+    if(oi) oi.innerHTML=_errOiHtml(id);
+    if(msg){ msg.className='s-queue'; msg.textContent='Files removed'; }
+    el.querySelector('.bar-fill').style.width='0%';
+    el.querySelector('.job-ct').textContent='';
     _removeRing(id);
   } else if(d.status==='running'||d.status==='verifying') {
     if(msg){ msg.className='s-run'; msg.textContent=d.pct>0?`${d.pct}%`:(d.status==='verifying'?'Verifying…':'Starting…'); }
@@ -1093,7 +1152,7 @@ function patchCard(id, d) {
         const live = document.getElementById(cardId(id));
         if(!live) return;
         live.style.order = calcOrder('done', 0);
-        if(!matchesFilter('done', currentFilter)) {
+        if(!matchesFilter({...(jobData.get(id)||{}), status:'done'}, currentFilter)) {
           const img = live.querySelector('.cover-img');
           if(img) imgObserver.unobserve(img);
           live.remove();
@@ -1101,7 +1160,7 @@ function patchCard(id, d) {
       }, 6000);
     } else {
       el.style.order = calcOrder(d.status, d.queue_pos||el.dataset.queuePos||0);
-      if(!matchesFilter(d.status, currentFilter)) {
+      if(!matchesFilter(merged, currentFilter)) {
         const img = el.querySelector('.cover-img');
         if(img) imgObserver.unobserve(img);
         el.remove();
@@ -1161,9 +1220,74 @@ function removeCard(id) {
   if(!jobsEl.querySelector('.job')) jobsEl.innerHTML='<p class="empty">No downloads yet.</p>';
 }
 
-async function removeJob(id) {
-  await fetch('/api/jobs/'+id, {method:'DELETE'});
-  removeCard(id);
+/* ── card ✕ menu: hide / remove files / delete permanently ── */
+let _menuFor = null;
+
+function openCardMenu(ev, id) {
+  ev.stopPropagation();
+  const menu = document.getElementById('card-menu');
+  if(_menuFor === id && menu.classList.contains('open')) { closeCardMenu(); return; }
+  _menuFor = id;
+  const d = jobData.get(id) || {};
+  menu.innerHTML = `
+    <button onclick="cardMenuAction('hide')">${d.hidden ? 'Unhide' : 'Hide'}</button>
+    <button onclick="cardMenuAction('remove')">Remove files</button>
+    <button class="danger" onclick="cardMenuAction('delete')">Delete permanently</button>`;
+  menu.classList.add('open');
+  const r = ev.currentTarget.getBoundingClientRect();
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  const left = Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8));
+  const top  = r.bottom + 4 + h > window.innerHeight - 8 ? r.top - h - 4 : r.bottom + 4;
+  menu.style.left = left + 'px';
+  menu.style.top  = Math.max(8, top) + 'px';
+}
+
+function closeCardMenu() {
+  document.getElementById('card-menu')?.classList.remove('open');
+  _menuFor = null;
+}
+document.addEventListener('click', e => { if(!e.target.closest('#card-menu')) closeCardMenu(); });
+document.addEventListener('keydown', e => { if(e.key === 'Escape') closeCardMenu(); });
+window.addEventListener('scroll', closeCardMenu, {passive:true});
+
+async function cardMenuAction(action) {
+  const id = _menuFor;
+  closeCardMenu();
+  if(!id) return;
+  if(id.startsWith('p-')) { removeCard(id); return; }  // a failed add that never reached the server
+  const d = jobData.get(id) || {};
+  const name = d.album || d.identifier || 'this album';
+  if(action === 'hide') {
+    const hidden = !d.hidden;
+    const res = await fetch(`/api/jobs/${id}/hide`, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify({hidden})});
+    if(res.ok) _setHidden(id, hidden);
+  } else if(action === 'remove') {
+    if(!confirm(`Delete the downloaded files for “${name}”?\n\nThe album stays in the list, so you can download it again later.`)) return;
+    const res = await fetch(`/api/jobs/${id}/remove-files`, {method:'POST'});
+    if(!res.ok) return;
+    (await res.json()).job_ids.forEach(jid => patchCard(jid, {status:'removed', pct:0, count:0, msg:''}));
+  } else if(action === 'delete') {
+    if(!confirm(`Permanently delete “${name}”?\n\nIts files are deleted and it goes on the do-not-download list, so it can't be added again.`)) return;
+    const res = await fetch(`/api/jobs/${id}`, {method:'DELETE'});
+    if(!res.ok) return;
+    (await res.json()).job_ids.forEach(jid => removeCard(jid));
+  }
+}
+
+function _setHidden(id, hidden) {
+  const old = jobData.get(id);
+  if(!old) return;
+  const d = {...old, hidden};
+  _storeSet(id, d);
+  _updateCountBadges();
+  const el = document.getElementById(cardId(id));
+  if(el && !matchesFilter(d, currentFilter)) {
+    const img = el.querySelector('.cover-img');
+    if(img) imgObserver.unobserve(img);
+    el.remove();
+  }
+  if(!jobsEl.querySelector('.job')) rebuildView();
 }
 
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -1177,7 +1301,7 @@ async function loadExisting() {
       job_id:j.job_id, identifier:j.identifier||'', artist:j.artist||'…', album:j.album||'',
       fmt:j.format||'—', cat:j.category, category:j.category, duplicate:j.duplicate||false,
       pct:j.pct||0, count:j.count||0, total:j.total||0,
-      status:j.status, error:j.error||null, queue_pos:j.queue_pos||0
+      status:j.status, error:j.error||null, queue_pos:j.queue_pos||0, hidden:!!j.hidden
     });
   });
   rebuildView();
@@ -1187,7 +1311,7 @@ async function loadExisting() {
 async function clearAll() {
   await fetch('/api/clear', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mode:'all'})});
   jobData.clear();
-  _fc.all = _fc.active = _fc.completed = _fc.failed = 0;
+  _fc.all = _fc.active = _fc.completed = _fc.failed = _fc.hidden = 0;
   jobsEl.innerHTML='<p class="empty">No downloads yet.</p>';
   _updateCountBadges();
 }
@@ -1558,6 +1682,10 @@ class ClearRequest(BaseModel):
     mode: str  # "all", "done", "retry_failed"
 
 
+class HideRequest(BaseModel):
+    hidden: bool
+
+
 class CategoryChangeRequest(BaseModel):
     category: str
 
@@ -1626,6 +1754,7 @@ async def list_jobs():
             "error":       job.get("error"),
             "queue_pos":   queue_list.index(jid) + 1 if jid in queue_list else 0,
             "file_states": fs,
+            "hidden":      job.get("hidden", False),
         })
     return result
 
@@ -1666,8 +1795,8 @@ async def retry_job(job_id: str):
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    if job["status"] != "error":
-        raise HTTPException(400, "Job is not in error state")
+    if job["status"] not in ("error", "removed"):
+        raise HTTPException(400, "Job is not in error or removed state")
     is_stub = not job.get("expected")
     job["status"] = "pending_meta" if is_stub else "queued"
     job["error"]  = None
@@ -1694,15 +1823,83 @@ async def move_job_to_front(job_id: str):
     return {"ok": True, "queue_pos": 1}
 
 
-@app.delete("/api/jobs/{job_id}")
-async def delete_job(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(404, "Job not found")
-    del jobs[job_id]
+async def _cancel_job(job_id: str):
+    """Take a job out of the queue and stop its download if one is running."""
+    job = jobs[job_id]
+    job["_run_id"] = None  # the running download, if any, exits without touching the job
     if job_id in queue_list:
         queue_list.remove(job_id)
+    proc = job.get("_proc")
+    if proc and proc.returncode is None:
+        proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+
+
+def _delete_album_dir(job: dict) -> bool:
+    """Delete <AUDIO_ROOT>/<category>/<identifier>, refusing any other shape of path."""
+    root   = Path(AUDIO_ROOT).resolve()
+    target = Path(job.get("dest", "")).resolve()
+    if target.parent.parent != root or target.name != job.get("identifier") or not target.is_dir():
+        return False
+    shutil.rmtree(target)
+    return True
+
+
+def _same_album(job: dict) -> List[str]:
+    # The same item added twice shares one folder, so album actions apply to both
+    return [jid for jid, j in jobs.items() if j.get("identifier") == job.get("identifier")]
+
+
+@app.post("/api/jobs/{job_id}/hide")
+async def hide_job(job_id: str, req: HideRequest):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    job["hidden"] = req.hidden
     save_jobs()
-    return {"ok": True}
+    return {"ok": True, "hidden": req.hidden}
+
+
+@app.post("/api/jobs/{job_id}/remove-files")
+async def remove_job_files(job_id: str):
+    """Delete the album's files but keep its entry, so it can be downloaded again."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    affected = _same_album(job)
+    for jid in affected:
+        await _cancel_job(jid)
+    removed_dir = _delete_album_dir(job)
+    for jid in affected:
+        j = jobs[jid]
+        j["status"]      = "removed"
+        j["error"]       = None
+        j["downloaded"]  = set()
+        j["file_states"] = {f: 0 for f in j.get("expected", [])}
+    history_remove(job["identifier"])
+    save_jobs()
+    return {"ok": True, "job_ids": affected, "removed_dir": removed_dir}
+
+
+@app.delete("/api/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Permanent delete: files, entry, and a do-not-download list entry."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    affected = _same_album(job)
+    for jid in affected:
+        await _cancel_job(jid)
+    removed_dir = _delete_album_dir(job)
+    for jid in affected:
+        del jobs[jid]
+    blocklist_add(job["identifier"])
+    history_remove(job["identifier"])
+    save_jobs()
+    return {"ok": True, "job_ids": affected, "removed_dir": removed_dir}
 
 
 @app.patch("/api/jobs/{job_id}/category")
@@ -1733,6 +1930,9 @@ async def start_download(req: DownloadRequest):
     identifier = req.url.strip().rstrip("/").split("/")[-1]
     if not identifier:
         raise HTTPException(400, "Invalid URL")
+    blocked = blocklist()
+    if identifier in blocked:
+        raise HTTPException(409, f"'{identifier}' was permanently deleted and is on the do-not-download list")
 
     meta = await _fetch_meta(identifier)
     if not meta:
@@ -1745,6 +1945,10 @@ async def start_download(req: DownloadRequest):
         child_ids = await _expand_collection(identifier)
         if not child_ids:
             raise HTTPException(404, "Collection is empty or could not be listed")
+        skipped   = [c for c in child_ids if c in blocked]
+        child_ids = [c for c in child_ids if c not in blocked]
+        if not child_ids:
+            raise HTTPException(409, "Every item in this collection is on the do-not-download list")
 
         category = req.category if req.category in CATEGORIES else "Auto"
         result_jobs = []
@@ -1773,7 +1977,7 @@ async def start_download(req: DownloadRequest):
             result_jobs.append({"job_id": job_id, "identifier": child_id,
                                  "status": "pending_meta", "category": category})
         save_jobs()
-        return {"collection": True, "count": len(child_ids),
+        return {"collection": True, "count": len(child_ids), "skipped_blocked": len(skipped),
                 "identifier": identifier, "jobs": result_jobs}
 
     # Single item
@@ -1811,6 +2015,8 @@ async def start_download(req: DownloadRequest):
 
 async def run_download(job_id: str, glob: str, verify: bool = False):
     job = jobs[job_id]
+    run_id = object()
+    job["_run_id"] = run_id  # _cancel_job() clears this; a stale run then exits quietly
     job["status"] = "verifying" if verify else "running"
     save_jobs()
     try:
@@ -1853,6 +2059,8 @@ async def run_download(job_id: str, glob: str, verify: bool = False):
             except asyncio.TimeoutError:
                 pass
         job["_proc"] = None
+        if job.get("_run_id") is not run_id:
+            return  # cancelled by remove-files / delete
         await _refresh(job_id)
         extract_err = None
         if proc.returncode == 0 and job.get("archive"):
@@ -1867,6 +2075,8 @@ async def run_download(job_id: str, glob: str, verify: bool = False):
         save_jobs()
     except Exception as exc:
         job["_proc"] = None
+        if job.get("_run_id") is not run_id:
+            return
         job["status"] = "error"
         job["error"]  = str(exc)
         save_jobs()
