@@ -234,19 +234,28 @@ def _parse_meta(meta: dict, identifier: str, category: str) -> dict | None:
     }
 
 
+META_RETRY_DELAYS = (5, 20)  # seconds between attempts when archive.org doesn't answer
+
+
 async def _fetch_meta(identifier: str) -> dict | None:
-    proc = await asyncio.create_subprocess_exec(
-        "ia", "metadata", identifier,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, _ = await proc.communicate()
-    if not stdout.strip():
-        return None
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        return None
+    """Item metadata; {} if the item doesn't exist; None if archive.org couldn't be
+    reached even after retries. Only a failed request is retried: a missing item
+    comes back as {} straight away, so retrying it would only waste time."""
+    for delay in (*META_RETRY_DELAYS, None):
+        proc = await asyncio.create_subprocess_exec(
+            "ia", "metadata", identifier,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0 and stdout.strip():
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                pass
+        if delay is None:
+            return None
+        await asyncio.sleep(delay)
 
 
 async def _expand_collection(identifier: str) -> List[str]:
@@ -268,7 +277,8 @@ async def _resolve_and_download(job_id: str):
             return  # removed or deleted while metadata was being fetched
         if not meta:
             job["status"] = "error"
-            job["error"]  = f"No metadata for '{identifier}'"
+            job["error"]  = (f"No metadata for '{identifier}'" if meta == {} else
+                             "archive.org didn't respond (3 tries) — Retry later")
             save_jobs()
             return
         fields = _parse_meta(meta, identifier, job.get("category", "Auto"))
@@ -1935,6 +1945,8 @@ async def start_download(req: DownloadRequest):
         raise HTTPException(409, f"'{identifier}' was permanently deleted and is on the do-not-download list")
 
     meta = await _fetch_meta(identifier)
+    if meta is None:
+        raise HTTPException(503, "archive.org didn't respond (3 tries) — try again later")
     if not meta:
         raise HTTPException(404, f"No metadata found for '{identifier}'")
 
