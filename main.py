@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from pydantic import BaseModel
 import asyncio, json, os, re, shutil, time, uuid
@@ -1700,9 +1701,52 @@ class CategoryChangeRequest(BaseModel):
     category: str
 
 
-@app.get("/", response_class=HTMLResponse)
+STATIC_DIR = Path(__file__).parent / "static"
+ART_DIR    = "/music/.ia-art"   # cached cover art, so the page can read its colors
+ART_ID_RE  = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/")
 async def index():
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/classic", response_class=HTMLResponse)
+async def classic_index():
+    # The previous interface, kept as a fallback while the redesign settles in
     return HTML
+
+
+def _fetch_art(identifier: str) -> bytes | None:
+    import requests
+    try:
+        r = requests.get(f"https://archive.org/services/img/{identifier}", timeout=20)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200 or not r.headers.get("content-type", "").startswith("image/"):
+        return None
+    return r.content
+
+
+@app.get("/api/art/{identifier}")
+async def album_art(identifier: str):
+    """Same-origin, cached cover art. archive.org's image service sends no CORS
+    header, so the browser can't read its pixels to tint Now Playing directly."""
+    if not ART_ID_RE.fullmatch(identifier):
+        raise HTTPException(404)
+    path = Path(ART_DIR) / f"{identifier}.img"
+    if not path.exists():
+        data = await asyncio.to_thread(_fetch_art, identifier)
+        if data is None:
+            raise HTTPException(404, "No cover art")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=604800"})
 
 
 @app.get("/api/status")
@@ -1765,6 +1809,7 @@ async def list_jobs():
             "queue_pos":   queue_list.index(jid) + 1 if jid in queue_list else 0,
             "file_states": fs,
             "hidden":      job.get("hidden", False),
+            "created_at":  job.get("created_at", 0),
         })
     return result
 

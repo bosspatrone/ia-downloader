@@ -6,6 +6,8 @@ Paste an archive.org item or collection URL, and it downloads the best audio ava
 
 ## Features
 
+- **Apple Music–style interface.** A Library of finished albums with album pages and track lists, a Downloads tab for the queue, and Search. Playback has a mini-player and a full-screen Now Playing view tinted from the album art, with lock-screen controls. On wide screens the tab bar becomes a sidebar. The previous interface is still available at `/classic`.
+
 - **Items and whole collections.** A collection URL is expanded into one queued job per item.
 - **Best format wins.** Formats are ranked by quality: FLAC, ALAC, MP3, Ogg Vorbis, then AAC (`.m4a`). ALAC and AAC are told apart using archive.org's per-file format label, and extension matching ignores case.
 - **Archive uploads.** If an item has no loose audio but has `.zip` or `.7z` uploads, they are downloaded and extracted. Only the best audio format inside is kept, and the archives are deleted afterwards. Extraction checks free disk space first and never writes outside the album folder.
@@ -45,7 +47,7 @@ Inside the mounted library folder (`/music` in the container):
 
 ## Stack
 
-FastAPI and uvicorn, serving a single-page frontend from `main.py`. No database.
+FastAPI and uvicorn. The frontend is plain HTML, CSS and JavaScript in `static/`, with no build step. Cover art is proxied and cached in `/music/.ia-art` so the page can read its colors. No database.
 
 ## License
 
